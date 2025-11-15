@@ -1,0 +1,18 @@
+[package]
+name = "raft"
+version = "0.1.0"
+edition = "2024"
+license-file = "LICENSE"
+description = ""
+documentation = "https://docs.rs/raft"
+repository = "https://github.com/negrel/raft"
+readme = "README.md"
+authors = ["Alexandre Negrel <alexandre@negrel.dev>"]
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+[lib]
+name = "lib"
+path = "src/lib.rs"
+
+[dependencies]
+log = "0.4.28"
