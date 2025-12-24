@@ -1,38 +1,19 @@
-# `raft` - 
+# `raft` - Sans I/O Implementation of the Raft Algorithm
 
+A zero-dependency, pure Rust implementation of the Raft consensus algorithm
+[without I/O](https://www.firezone.dev/blog/sans-io).
 
+Official paper: [Raft Consensus Algorithm](https://raft.github.io/raft.pdf)
 
-## Why ?
+## Why?
 
-- What was your motivation?
-- Why did you build this project?
-- What problem does it solve?
-- What did you learn?
-- What makes your project stand out?
+Raft is at the core of modern distributed systems.
+[Kubernetes](https://kubernetes.io/), [etcd](https://etcd.io/), and many other
+critical infrastructure components use Raft as their consensus algorithm.
 
-If your project has a lot of features, consider adding a "Features" section and listing them here.
-
-## Getting started
-
-### Configuration
-
-Here is a table of configuration options:
-
-|  Option name  | Default value |           Description            |
-| :-----------: | :-----------: | :------------------------------: |
-| `OPTION_NAME` |    `VALUE`    |       Option description.        |
-
-### Building the project
-
-```shell
-make build
-```
-
-### Running the tests
-
-```shell
-make tests
-```
+I learn and understand best by building things. I’ve found that edge cases and
+corner cases are often revealed during development. Reading the paper isn't
+enough for me.
 
 ## Contributing
 
