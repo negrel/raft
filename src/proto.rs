@@ -11,7 +11,7 @@ pub type ServerId = usize;
 pub type Index = usize;
 
 /// LogEntry defines a single entry in the replicated Raft log.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LogEntry {
     pub index: Index,
     pub term: Term,

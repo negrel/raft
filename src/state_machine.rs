@@ -5,7 +5,7 @@ use std::{
 };
 
 use crate::{
-    CandidateVolatileState, LeaderVolatileState, ServerId, ServerPersistentState,
+    CandidateVolatileState, LeaderVolatileState, LogEntry, ServerId, ServerPersistentState,
     ServerVolatileState, rpc,
 };
 
@@ -67,6 +67,20 @@ impl Server {
             config: cfg,
             last_rpc: now,
             election_timeout,
+        }
+    }
+
+    /// Returns log entries to be applied to your state machine and synchronize
+    /// last applied with commit index.
+    pub fn to_be_applied(&mut self) -> &[LogEntry] {
+        if self.volatile.last_applied < self.volatile.commit_index {
+            let start = self.volatile.last_applied + 1;
+            self.volatile.last_applied = self.volatile.commit_index;
+            self.persistent
+                .log
+                .slice(start, Some(self.volatile.commit_index))
+        } else {
+            &[]
         }
     }
 
@@ -133,7 +147,7 @@ impl Server {
 
     /// Process RequestVote RPC call.
     pub fn handle_vote_request(
-        &self,
+        &mut self,
         req: rpc::RequestVoteRequest,
     ) -> (rpc::RequestVoteRequest, rpc::RequestVoteResponse) {
         let reject = rpc::RequestVoteResponse {
@@ -148,6 +162,16 @@ impl Server {
         // 1. Reply false if term < currentTerm.
         if req.term < self.persistent.current_term {
             return (req, reject);
+        }
+
+        // If RPC request or response contains term T > currentTerm:
+        // set currentTerm = T, convert to follower
+        if req.term > self.persistent.current_term {
+            self.persistent.current_term = req.term;
+            match self.state {
+                State::Follower => {}
+                _ => self.state = State::Follower,
+            }
         }
 
         // 2. If votedFor is null or candidateId, and candidate's log is at
@@ -173,6 +197,16 @@ impl Server {
 
     /// Process RequestVote RPC response.
     pub fn handle_vote_response(&mut self, resp: rpc::RequestVoteResponse) {
+        // If RPC request or response contains term T > currentTerm:
+        // set currentTerm = T, convert to follower
+        if resp.term > self.persistent.current_term {
+            self.persistent.current_term = resp.term;
+            match self.state {
+                State::Follower => {}
+                _ => self.state = State::Follower,
+            }
+        }
+
         let quorum = self.config.peers.len() / 2;
         if let State::Candidate(state) = &mut self.state {
             if resp.vote_granted {
@@ -215,6 +249,16 @@ impl Server {
             return (req, reject);
         }
 
+        // If RPC request or response contains term T > currentTerm:
+        // set currentTerm = T, convert to follower
+        if req.term > self.persistent.current_term {
+            self.persistent.current_term = req.term;
+            match self.state {
+                State::Follower => {}
+                _ => self.state = State::Follower,
+            }
+        }
+
         // 2. Reply false if log doesn't contain an entry at prevLogIndex whose
         // term matches prevLogTerm.
         if let Some(entry) = self.persistent.log.get(req.prev_log_index) {
@@ -243,7 +287,7 @@ impl Server {
         // 5. If leaderCommit > commitIndex, set commitIndex = min(leaderCommit,
         // index of last new entry).
         if req.leader_commit > self.volatile.commit_index {
-            self.volatile.commit_index = min(req.leader_commit, index_of_last_new_entry)
+            self.volatile.commit_index = min(req.leader_commit, index_of_last_new_entry);
         }
 
         (req, success)
@@ -255,6 +299,16 @@ impl Server {
         &mut self,
         resp: rpc::AppendEntriesResponse,
     ) -> Option<(ServerId, rpc::AppendEntriesRequest)> {
+        // If RPC request or response contains term T > currentTerm:
+        // set currentTerm = T, convert to follower
+        if resp.term > self.persistent.current_term {
+            self.persistent.current_term = resp.term;
+            match self.state {
+                State::Follower => {}
+                _ => self.state = State::Follower,
+            }
+        }
+
         // If not leader ignore response.
         let state = match &mut self.state {
             State::Leader(leader) => leader,
@@ -470,7 +524,7 @@ mod tests {
         }
 
         // Execute test steps.
-        for (i, step) in steps.into_iter().enumerate() {
+        for step in steps {
             match step {
                 Step::Sleep(duration) => thread::sleep(duration),
                 Step::ElectionTimeout => {
@@ -614,6 +668,14 @@ mod tests {
         assert_eq!(followers.len(), 2);
         assert_eq!(leaders.len(), 1);
         assert_eq!(leaders[0].config.id, 1);
+        assert_eq!(
+            followers[0].to_be_applied().to_vec(),
+            followers[1].to_be_applied().to_vec()
+        );
+        assert_eq!(
+            followers[0].to_be_applied().to_vec(),
+            leaders[0].to_be_applied().to_vec()
+        );
     }
 
     #[test]
@@ -658,5 +720,13 @@ mod tests {
         assert_eq!(followers.len(), 2);
         assert_eq!(leaders.len(), 1);
         assert_eq!(leaders[0].config.id, 2);
+        assert_eq!(
+            followers[0].to_be_applied().to_vec(),
+            followers[1].to_be_applied().to_vec()
+        );
+        assert_eq!(
+            followers[0].to_be_applied().to_vec(),
+            leaders[0].to_be_applied().to_vec()
+        );
     }
 }
