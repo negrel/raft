@@ -406,23 +406,6 @@ impl Server {
     }
 }
 
-/// User action to do before interacting with the state machine again.
-#[derive(Debug)]
-pub enum Action {
-    /// Server received no message for a moment, start a new election.
-    StartElection,
-
-    /// Make a RequestVote RPC call.
-    RequestVote((ServerId, rpc::RequestVoteRequest)),
-    /// Response to RequestVote RPC call.
-    Vote((rpc::RequestVoteRequest, rpc::RequestVoteResponse)),
-
-    /// Make an AppendEntries RPC call.
-    AppendEntries((ServerId, rpc::AppendEntriesRequest)),
-    /// Response to AppendEntries RPC call.
-    AckEntries((ServerId, rpc::AppendEntriesResponse)),
-}
-
 /// Action to be done after a tick.
 pub enum TickAction {
     /// Node is the leader and must send heartbeat RPC request to maintain
