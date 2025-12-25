@@ -1,15 +1,16 @@
 use std::{
+    cmp::min,
     ops::Range,
     time::{Duration, Instant},
 };
 
 use crate::{
-    CandidateVolatileState, Index, LeaderVolatileState, ServerId, ServerPersistentState,
-    ServerVolatileState, Term, rpc,
+    CandidateVolatileState, LeaderVolatileState, ServerId, ServerPersistentState,
+    ServerVolatileState, rpc,
 };
 
 /// Raft server configuration.
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct Config {
     /// Unique server identifier across whole cluster.
     id: ServerId,
@@ -37,6 +38,7 @@ pub enum Either<L, R> {
 }
 
 /// A Raft server within a cluster.
+#[derive(Debug)]
 pub struct Server {
     /// Server state that must be updated on stable storage before responding to
     /// RPC.
@@ -69,53 +71,54 @@ impl Server {
     }
 
     /// Check for heartbeat or election timeout.
-    pub fn tick(&mut self, now: Instant) -> Vec<Action> {
+    pub fn tick(&mut self, now: Instant) -> TickAction {
         let since_last_rpc = now.duration_since(self.last_rpc);
-        let mut actions = Vec::new();
 
         match &mut self.state {
             State::Leader(..) => {
                 if since_last_rpc > self.config.heartbeat {
-                    self.heartbeat(&mut actions);
+                    let reqs = self.heartbeat();
                     self.last_rpc = now;
+                    return TickAction::Heartbeat(reqs);
                 }
             }
             // Followers and Candidates.
             State::Follower | State::Candidate(..) => {
                 if since_last_rpc > self.election_timeout {
-                    actions.push(Action::StartElection);
-
                     // Update election timeout.
                     self.election_timeout = Self::random_election_timeout(
                         since_last_rpc,
                         self.config.election_timeout.clone(),
                     );
+
+                    return TickAction::StartElection;
                 }
             }
         }
 
-        actions
+        TickAction::None
     }
 
-    /// Start an election.
-    pub fn start_election(&mut self, candidate: bool) -> Vec<Action> {
-        let mut actions = Vec::new();
+    /// Start an election to elect a new leader. This function returns non empty
+    /// vector if server is a candidate.
+    pub fn start_election(&mut self, candidate: bool) -> Vec<(ServerId, rpc::RequestVoteRequest)> {
+        let mut requests = Vec::new();
 
         if candidate {
             // Overflow occurs after thousand years.
             self.persistent.current_term = self.persistent.current_term.strict_add(1);
 
-            // Make RequestVote RPC call.
+            // Make RequestVote RPC call to each peer.
             for id in &self.config.peers {
-                actions.push(Action::RequestVote((
+                requests.push((
                     *id,
                     rpc::RequestVoteRequest {
                         term: self.persistent.current_term,
                         candidate_id: self.config.id,
-                        last_log_index: self.last_log_index(),
-                        last_log_term: self.last_log_term(),
+                        last_log_index: self.persistent.log.last_index(),
+                        last_log_term: self.persistent.log.last_term(),
                     },
-                )));
+                ));
             }
 
             // Transition to candidate.
@@ -125,11 +128,14 @@ impl Server {
             self.state = State::Follower;
         }
 
-        actions
+        requests
     }
 
     /// Process RequestVote RPC call.
-    pub fn request_vote(&self, req: rpc::RequestVoteRequest) -> Vec<Action> {
+    pub fn handle_vote_request(
+        &self,
+        req: rpc::RequestVoteRequest,
+    ) -> (rpc::RequestVoteRequest, rpc::RequestVoteResponse) {
         let reject = rpc::RequestVoteResponse {
             term: self.persistent.current_term,
             vote_granted: false,
@@ -139,40 +145,44 @@ impl Server {
             vote_granted: true,
         };
 
-        let mut actions = Vec::new();
-
         // 1. Reply false if term < currentTerm.
         if req.term < self.persistent.current_term {
-            actions.push(Action::Vote((req, reject)));
-            return actions;
+            return (req, reject);
         }
 
         // 2. If votedFor is null or candidateId, and candidate's log is at
         // least as up-to-date as receiver's log, grant vote.
+
+        // votedFor != candidateId, don't grant vote.
         if let Some(id) = self.persistent.voted_for
             && id != req.candidate_id
         {
-            actions.push(Action::Vote((req, reject)));
-            return actions;
-        }
-        if self.last_log_index() > req.last_log_index || self.last_log_term() > req.last_log_term {
-            actions.push(Action::Vote((req, reject)));
-            return actions;
+            return (req, reject);
         }
 
-        actions.push(Action::Vote((req, grant)));
-        actions
+        // candidate's log is out of date, don't grant vote.
+        if self.persistent.log.last_index() > req.last_log_index
+            || self.persistent.log.last_term() > req.last_log_term
+        {
+            return (req, reject);
+        }
+
+        // Grant vote.
+        (req, grant)
     }
 
     /// Process RequestVote RPC response.
-    pub fn vote_response(&mut self, resp: rpc::RequestVoteResponse) {
+    pub fn handle_vote_response(&mut self, resp: rpc::RequestVoteResponse) {
         let quorum = self.config.peers.len() / 2;
         if let State::Candidate(state) = &mut self.state {
             if resp.vote_granted {
                 state.granted_vote += 1;
                 if state.granted_vote > quorum {
                     // Transition to leader.
-                    self.state = State::Leader(LeaderVolatileState::default());
+                    self.state = State::Leader(LeaderVolatileState::new(
+                        self.persistent.log.last_index(),
+                        self.config.peers.iter(),
+                    ));
                 }
             } else {
                 state.rejected_vote += 1;
@@ -184,33 +194,155 @@ impl Server {
         }
     }
 
-    fn heartbeat(&self, actions: &mut Vec<Action>) {
+    /// Process AppendEntries RPC request and return response to be send.
+    pub fn handle_append_entries_request(
+        &mut self,
+        req: rpc::AppendEntriesRequest,
+    ) -> (rpc::AppendEntriesRequest, rpc::AppendEntriesResponse) {
+        let reject = rpc::AppendEntriesResponse {
+            follower_id: self.config.id,
+            term: self.persistent.current_term,
+            success: false,
+        };
+        let success = rpc::AppendEntriesResponse {
+            follower_id: self.config.id,
+            term: self.persistent.current_term,
+            success: true,
+        };
+
+        // 1. Reply false if term < currentTerm.
+        if req.term < self.persistent.current_term {
+            return (req, reject);
+        }
+
+        // 2. Reply false if log doesn't contain an entry at prevLogIndex whose
+        // term matches prevLogTerm.
+        if let Some(entry) = self.persistent.log.get(req.prev_log_index) {
+            // 3. If an existing entry conflicts with a new one (same index but
+            // different terms), delete the existing entry and all that follow
+            // it.
+            if entry.term != req.prev_log_term {
+                self.persistent.log.truncate(req.prev_log_index);
+            }
+        } else if req.prev_log_index == 0 {
+            // First entry.
+            self.persistent.log.append(req.entries.clone());
+        } else {
+            return (req, reject);
+        }
+
+        // 4. Append any new entries not already in the log.
+        if let Some(last) = self.persistent.log.last()
+            && last.index != req.prev_log_index
+        {
+            self.persistent.log.truncate(req.prev_log_index);
+        }
+        let index_of_last_new_entry = req.entries.last().map(|e| e.index).unwrap_or(0);
+        self.persistent.log.append(req.entries.clone());
+
+        // 5. If leaderCommit > commitIndex, set commitIndex = min(leaderCommit,
+        // index of last new entry).
+        if req.leader_commit > self.volatile.commit_index {
+            self.volatile.commit_index = min(req.leader_commit, index_of_last_new_entry)
+        }
+
+        (req, success)
+    }
+
+    /// Process AppendEntries RPC response and return another request to send
+    /// if follower rejected entries.
+    pub fn handle_append_entries_response(
+        &mut self,
+        resp: rpc::AppendEntriesResponse,
+    ) -> Option<(ServerId, rpc::AppendEntriesRequest)> {
+        // If not leader ignore response.
+        let state = match &mut self.state {
+            State::Leader(leader) => leader,
+            _ => return None,
+        };
+
+        if let Some(follower) = state
+            .followers
+            .iter_mut()
+            .find(|f| f.id == resp.follower_id)
+        {
+            if resp.success {
+                follower.next_index = self.persistent.log.last_index() + 1;
+
+                // If there exists an N such that N > commitIndex, a majority of
+                // matchIndex[i] >= N, and log[N].term == currentTerm:
+                // set commitIndex = N
+                let majority_commit_index = state.majority_commit_index();
+                if majority_commit_index > self.volatile.commit_index
+                    && self
+                        .persistent
+                        .log
+                        .get(majority_commit_index)
+                        .map(|e| e.term)
+                        == Some(self.persistent.current_term)
+                {
+                    self.volatile.commit_index = majority_commit_index;
+                }
+
+                None
+            } else {
+                // Decrement and try again.
+                follower.next_index -= 1;
+                if follower.next_index == 0 {
+                    log::error!("raft follower refused first log");
+                    follower.next_index = 1;
+                    return None;
+                }
+
+                let prev_log_index = follower.next_index - 1;
+                Some((
+                    follower.id,
+                    rpc::AppendEntriesRequest {
+                        term: self.persistent.current_term,
+                        leader_id: self.config.id,
+                        prev_log_index,
+                        prev_log_term: self
+                            .persistent
+                            .log
+                            .get(prev_log_index)
+                            .map(|e| e.term)
+                            .unwrap_or(0),
+                        entries: self
+                            .persistent
+                            .log
+                            .slice(follower.next_index, None)
+                            .to_vec(),
+                        leader_commit: self.volatile.commit_index,
+                    },
+                ))
+            }
+        } else {
+            // Unknown follower.
+            None
+        }
+    }
+
+    fn heartbeat(&self) -> Vec<(ServerId, rpc::AppendEntriesRequest)> {
         match &self.state {
             State::Leader { .. } => {
+                let mut actions = Vec::new();
                 for id in &self.config.peers {
-                    actions.push(Action::AppendEntries((
+                    actions.push((
                         *id,
                         rpc::AppendEntriesRequest {
                             term: self.persistent.current_term,
                             leader_id: self.config.id,
-                            prev_log_index: self.last_log_index(),
-                            prev_log_term: self.last_log_term(),
+                            prev_log_index: self.persistent.log.last_index(),
+                            prev_log_term: self.persistent.log.last_term(),
                             entries: Vec::new(),
                             leader_commit: self.volatile.commit_index,
                         },
-                    )));
+                    ));
                 }
+                actions
             }
             _ => unreachable!(),
         }
-    }
-
-    fn last_log_index(&self) -> Index {
-        self.persistent.log.last().map(|e| e.index).unwrap_or(0)
-    }
-
-    fn last_log_term(&self) -> Term {
-        self.persistent.log.last().map(|e| e.term).unwrap_or(0)
     }
 
     /// Update election timeout with a random duration within configured range.
@@ -223,11 +355,8 @@ impl Server {
 /// User action to do before interacting with the state machine again.
 #[derive(Debug)]
 pub enum Action {
-    /// Server timed out, start a new election.
+    /// Server received no message for a moment, start a new election.
     StartElection,
-
-    /// Save state on persistent storage.
-    SaveState(ServerPersistentState),
 
     /// Make a RequestVote RPC call.
     RequestVote((ServerId, rpc::RequestVoteRequest)),
@@ -236,6 +365,19 @@ pub enum Action {
 
     /// Make an AppendEntries RPC call.
     AppendEntries((ServerId, rpc::AppendEntriesRequest)),
+    /// Response to AppendEntries RPC call.
+    AckEntries((ServerId, rpc::AppendEntriesResponse)),
+}
+
+/// Action to be done after a tick.
+pub enum TickAction {
+    /// Node is the leader and must send heartbeat RPC request to maintain
+    /// authority.
+    Heartbeat(Vec<(ServerId, rpc::AppendEntriesRequest)>),
+    /// Node is a follower/candidate and a new election is started.
+    StartElection,
+    /// Nothing to be done.
+    None,
 }
 
 #[cfg(test)]
@@ -247,16 +389,29 @@ mod tests {
 
     use super::*;
 
-    /// Event is define a server event.
+    /// Event defines a server event such as RPC calls, crash and more.
     #[derive(Debug)]
     enum Event {
+        // Update server clock.
         Tick(Instant),
+        // Sets whether server is a candidate on next elections.
         CandidateOnElection(bool),
+        // Process RequestVote RPC call.
         RequestVote(rpc::RequestVoteRequest),
+        // Process RequestVote RPC response.
         Vote(rpc::RequestVoteResponse),
+        // Process AppendEntries RPC call.
+        AppendEntries(rpc::AppendEntriesRequest),
+        // Process AppendEntries RPC response.
+        AppendEntriesResponse(rpc::AppendEntriesResponse),
+        // Crash server and ignore all events until recover.
+        Crash,
+        // Recover from previous crash and accept new events.
+        Recover,
     }
 
     /// Step define a test case step.
+    #[derive(Debug)]
     enum Step {
         // Sleep for duration, no tick happens between during sleep.
         Sleep(Duration),
@@ -315,7 +470,7 @@ mod tests {
         }
 
         // Execute test steps.
-        for step in steps {
+        for (i, step) in steps.into_iter().enumerate() {
             match step {
                 Step::Sleep(duration) => thread::sleep(duration),
                 Step::ElectionTimeout => {
@@ -337,55 +492,74 @@ mod tests {
                     tx.send(event).unwrap();
                 }
             }
+            thread::yield_now();
         }
 
         // Join threads.
         threads.into_iter().map(|t| t.join().unwrap()).collect()
     }
 
+    /// Event loop of a single Raft node.
     fn node_loop(
         mut node: Server,
         txs: Vec<mpsc::Sender<Event>>,
         rx: mpsc::Receiver<Event>,
         barrier: Arc<sync::Barrier>,
     ) -> Server {
+        let mut is_crashed = false;
         let mut is_candidate = false;
-        let mut actions;
 
         while let Ok(event) = rx.recv_timeout(3 * HEARTBEAT) {
-            actions = match event {
-                Event::Tick(instant) => node.tick(instant),
+            // While crashed ignore all events.
+            if is_crashed {
+                if let Event::Recover = event {
+                    // Reset node state.
+                    node = new_server(node.config.id, node.config.peers);
+                    is_crashed = false;
+                }
+                continue;
+            }
+
+            match event {
+                Event::Tick(instant) => match node.tick(instant) {
+                    TickAction::Heartbeat(items) => {
+                        for (remote_id, req) in items {
+                            txs[remote_id].send(Event::AppendEntries(req)).unwrap();
+                        }
+                    }
+                    TickAction::StartElection => {
+                        for (remote_id, req) in node.start_election(is_candidate) {
+                            txs[remote_id].send(Event::RequestVote(req)).unwrap();
+                        }
+                    }
+                    TickAction::None => {}
+                },
                 Event::CandidateOnElection(candidate) => {
                     is_candidate = candidate;
-                    Vec::new()
                 }
-                Event::RequestVote(req) => node.request_vote(req),
+                Event::RequestVote(req) => {
+                    let (req, resp) = node.handle_vote_request(req);
+                    txs[req.candidate_id].send(Event::Vote(resp)).unwrap();
+                }
                 Event::Vote(resp) => {
-                    node.vote_response(resp);
-                    Vec::new()
+                    node.handle_vote_response(resp);
+                }
+                Event::Crash => {
+                    is_crashed = true;
+                }
+                Event::Recover => unreachable!(),
+                Event::AppendEntries(req) => {
+                    let (req, resp) = node.handle_append_entries_request(req);
+                    txs[req.leader_id]
+                        .send(Event::AppendEntriesResponse(resp))
+                        .unwrap();
+                }
+                Event::AppendEntriesResponse(resp) => {
+                    if let Some((remote_id, req)) = node.handle_append_entries_response(resp) {
+                        txs[remote_id].send(Event::AppendEntries(req)).unwrap()
+                    }
                 }
             };
-
-            while !actions.is_empty() {
-                let mut new_actions = Vec::new();
-                for a in actions {
-                    let mut v = match a {
-                        Action::StartElection => node.start_election(is_candidate),
-                        Action::SaveState(_) => todo!(),
-                        Action::RequestVote((remote_id, req)) => {
-                            txs[remote_id].send(Event::RequestVote(req)).unwrap();
-                            Vec::new()
-                        }
-                        Action::Vote((req, resp)) => {
-                            txs[req.candidate_id].send(Event::Vote(resp)).unwrap();
-                            Vec::new()
-                        }
-                        Action::AppendEntries(_) => Vec::new(),
-                    };
-                    new_actions.append(&mut v);
-                }
-                actions = new_actions;
-            }
         }
 
         barrier.wait();
@@ -426,18 +600,63 @@ mod tests {
         );
         assert!(servers.len() == 3);
 
-        let mut followers = 0;
-        let mut leaders = 0;
+        let mut followers = Vec::new();
+        let mut leaders = Vec::new();
 
         for srv in servers {
             match srv.state {
-                State::Follower => followers += 1,
-                State::Leader(_) => leaders += 1,
+                State::Follower => followers.push(srv),
+                State::Leader(_) => leaders.push(srv),
                 State::Candidate(_) => unreachable!(),
             }
         }
 
-        assert_eq!(followers, 2);
-        assert_eq!(leaders, 1);
+        assert_eq!(followers.len(), 2);
+        assert_eq!(leaders.len(), 1);
+        assert_eq!(leaders[0].config.id, 1);
+    }
+
+    #[test]
+    fn election_after_crash() {
+        let servers = test_case(
+            3,
+            vec![
+                Step::Tick,
+                Step::Event((1, Event::CandidateOnElection(true))),
+                Step::ElectionTimeout,
+                Step::Tick,
+                Step::Sleep(HEARTBEAT),
+                Step::Tick,
+                Step::Sleep(HEARTBEAT),
+                Step::Event((1, Event::Crash)), // Crash leader.
+                Step::Event((2, Event::CandidateOnElection(true))),
+                Step::ElectionTimeout, // Start new election.
+                Step::Tick,
+                Step::Sleep(HEARTBEAT),
+                Step::Tick,
+                Step::Sleep(HEARTBEAT),
+                Step::Event((1, Event::Recover)), // Recover previous leader.
+                Step::Tick,
+                Step::Sleep(HEARTBEAT),
+                Step::Tick,
+                Step::Sleep(HEARTBEAT),
+            ],
+        );
+        assert!(servers.len() == 3);
+
+        let mut followers = Vec::new();
+        let mut leaders = Vec::new();
+
+        for srv in servers {
+            match srv.state {
+                State::Follower => followers.push(srv),
+                State::Leader(_) => leaders.push(srv),
+                State::Candidate(_) => unreachable!(),
+            }
+        }
+
+        assert_eq!(followers.len(), 2);
+        assert_eq!(leaders.len(), 1);
+        assert_eq!(leaders[0].config.id, 2);
     }
 }

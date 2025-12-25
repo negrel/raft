@@ -1,4 +1,4 @@
-//! This module contains Raft protocol RPC types.
+//! This module contains Raft algorithm and RPCs types.
 
 /// A term is a period during which a leader is elected and operates.
 pub type Term = usize;
@@ -24,7 +24,7 @@ pub mod rpc {
 
     /// RPC call invoked by leader to replicate log entries; also used as heart
     /// beat to maintain authority.
-    #[derive(Debug)]
+    #[derive(Debug, Clone)]
     pub struct AppendEntriesRequest {
         /// Leader's term.
         pub term: Term,
@@ -42,17 +42,20 @@ pub mod rpc {
     }
 
     /// Result of [AppendEntriesRequest] RPC call.
-    #[derive(Debug)]
+    #[derive(Debug, Clone)]
     pub struct AppendEntriesResponse {
         /// Current term, for leader to update itself.
         pub term: Term,
         /// True if follower contained entry matching prev_log_index and
         /// prev_log_term.
         pub success: bool,
+
+        /// Follower that produced the response.
+        pub follower_id: ServerId,
     }
 
     /// RPC call invoked by candidates to gather votes.
-    #[derive(Debug)]
+    #[derive(Debug, Clone)]
     pub struct RequestVoteRequest {
         /// Candidate's term.
         pub term: Term,
@@ -65,7 +68,7 @@ pub mod rpc {
     }
 
     /// Result of [RequestVoteRequest] RPC call.
-    #[derive(Debug)]
+    #[derive(Debug, Clone)]
     pub struct RequestVoteResponse {
         /// Current term, for leader to update itself.
         pub term: Term,
@@ -85,35 +88,67 @@ pub struct ServerPersistentState {
     pub voted_for: Option<usize>,
     /// Log entries; each entry contains command for state machine, and term
     /// when entry was received by leader (first index is 1).
-    pub log: Vec<LogEntry>,
+    pub log: Log,
 }
 
-impl ServerPersistentState {
-    fn find_log(&self, log_idx: Index, log_term: Term) -> Option<usize> {
-        if let Some(f) = self.log.first() {
-            if log_idx < f.index {
-                // This branch should never happen as we keep all log entries in
-                // memory.
-                todo!("TODO: return None once snapshotting is implemented");
-            } else if log_idx > f.index {
-                let diff = log_idx - f.index;
-                if let Some(entry) = self.log.get(f.index + diff)
-                    && entry.term == log_term
-                {
-                    return Some(diff);
-                }
-            } else if f.term == log_term {
-                return Some(0);
-            }
+/// Log entries; each entry contains command for state machine, and term when
+/// entry was received by leader (first index is 1).
+#[derive(Debug, Clone)]
+pub struct Log {
+    entries: Vec<LogEntry>,
+
+    offset: usize,
+}
+
+impl Default for Log {
+    fn default() -> Self {
+        Self {
+            entries: Default::default(),
+            offset: 1, // Log index starts at 1.
+        }
+    }
+}
+
+impl Log {
+    pub fn get(&self, index: usize) -> Option<&LogEntry> {
+        if index < self.offset {
+            return None;
         }
 
-        None
+        self.entries.get(index - self.offset)
+    }
+
+    pub fn truncate(&mut self, len: usize) {
+        self.entries.truncate(len - self.offset)
+    }
+
+    pub fn last(&self) -> Option<&LogEntry> {
+        self.entries.last()
+    }
+
+    pub fn append(&mut self, mut other: Vec<LogEntry>) {
+        self.entries.append(&mut other);
+    }
+
+    pub fn slice(&self, from: usize, to: Option<usize>) -> &[LogEntry] {
+        match to {
+            Some(to) => &self.entries[from - self.offset..to - self.offset],
+            None => &self.entries[from - self.offset..],
+        }
+    }
+
+    pub fn last_index(&self) -> Index {
+        self.entries.last().map(|e| e.index).unwrap_or(0)
+    }
+
+    pub fn last_term(&self) -> Term {
+        self.entries.last().map(|e| e.term).unwrap_or(0)
     }
 }
 
 /// Raft server volatile state that is present regardless of its role (leader,
 /// follower, or candidate).
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub(crate) struct ServerVolatileState {
     /// Index of highest log entry known to be committed (initialized to 0,
     /// increases monotonically).
@@ -131,14 +166,48 @@ pub(crate) struct CandidateVolatileState {
 }
 
 /// Raft server volatile state when leading the cluster.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(crate) struct LeaderVolatileState {
     pub followers: Vec<Follower>,
 }
 
+impl LeaderVolatileState {
+    pub fn new<'a>(last_log_index: Index, ids: impl Iterator<Item = &'a ServerId>) -> Self {
+        let followers = ids
+            .map(|id| Follower {
+                id: *id,
+                next_index: last_log_index + 1,
+                match_index: 0,
+            })
+            .collect();
+
+        Self { followers }
+    }
+
+    /// Returns index of log committed by majority of followers.
+    pub fn majority_commit_index(&self) -> Index {
+        if self.followers.is_empty() {
+            return 0;
+        }
+
+        // Compute median.
+        let mut match_indexes: Vec<Index> = self.followers.iter().map(|e| e.match_index).collect();
+        match_indexes.sort();
+
+        let half = match_indexes.len() / 2;
+        if match_indexes.len().is_multiple_of(2) && match_indexes.len() > 2 {
+            // Suppose there is 4 followers with following commit indexes:
+            // [1, 2, 3, 4] we want to return 3 because leader has committed 3.
+            match_indexes[half + 1]
+        } else {
+            match_indexes[half]
+        }
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct Follower {
-    // Unique identifier across whole Raft cluster.
+    /// Unique identifier across whole Raft cluster.
     pub id: ServerId,
     /// Index of the next log entry to send to that server (initialized to
     /// leader last log index + 1)
